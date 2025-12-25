@@ -1,6 +1,6 @@
+# -*- coding: utf-8 -*-
 import io
 import re
-import unicodedata
 from datetime import datetime
 
 import streamlit as st
@@ -55,7 +55,8 @@ def br_to_float(txt: str):
 
 
 def is_num_token(tok: str) -> bool:
-    return bool(re.fullmatch(r"[0-9][0-9\.\,]*", (tok or "").strip()))
+    """Verifica se é um token numérico (preço)"""
+    return bool(re.fullmatch(r"[0-9]+[\.\,][0-9]{2}", (tok or "").strip()))
 
 
 def extract_text_with_pypdf(file) -> str:
@@ -96,7 +97,6 @@ def sugestao_mes_semana(dt_ini):
 def clean_produto_name(nome: str) -> str:
     nome = (nome or "").strip()
     nome = re.sub(r"\s{2,}", " ", nome)
-    nome = re.sub(r"^\-\s*", "", nome)
     return nome
 
 
@@ -105,13 +105,17 @@ def clean_produto_name(nome: str) -> str:
 # =========================
 def parse_perdas_lince(text: str):
     """
-    Parser robusto para 'Perdas por Departamento' (Lince)
-
+    Parser para 'Perdas por Departamento' (Lince)
+    
+    Formato da linha:
+    CODIGO NOME_PRODUTO UNIDADE UNIDADE PRECO QUANTIDADE VALOR-
+    
+    Exemplo:
+    001681 SALG COQUETEL ASSADO KG KG 69,90 7,64 534,18-
+    
     Regras:
-    - Quantidade = número logo após o '-'
-    - Valor = último número da linha
-    - Nome = tudo entre o código e o preço
-    - Mantém 'KG' quando fizer parte do nome
+    - Quantidade e Valor são os dois últimos números antes do '-'
+    - Nome é tudo entre CODIGO e os 3 últimos números (preço, qtd, valor)
     """
     lines = [
         re.sub(r"\s{2,}", " ", (ln or "")).strip()
@@ -120,7 +124,7 @@ def parse_perdas_lince(text: str):
 
     lixo = (
         "SHOPPING DO PAO", "Perdas por Departamento", "Pag.",
-        "Período:", "Periodo:", "UN Preço Qtde Venda",
+        "Período:", "Periodo:", "UN Preço Qtde Venda", "PreçoQtde Venda",
         "Sub Departamento:", "Setor:",
         "Total do Departamento", "Total Geral",
         "www.grupotecnoweb.com.br", "Lince "
@@ -134,31 +138,41 @@ def parse_perdas_lince(text: str):
         if not toks:
             continue
 
-        # código do produto
+        # Deve ter código do produto
         if not re.fullmatch(r"\d{3,10}", toks[0]):
             continue
 
+        # Deve ter o hífen no final
         if "-" not in toks:
             continue
 
         idx_hifen = toks.index("-")
-        if idx_hifen + 2 >= len(toks):
+        
+        # Precisa ter pelo menos: CODIGO NOME PRECO QTD VALOR -
+        if idx_hifen < 4:
             continue
 
-        qtd = br_to_float(toks[idx_hifen + 1])
-        valor = br_to_float(toks[idx_hifen + 2])
+        # Antes do hífen temos: [CODIGO, NOME..., PRECO, QTD, VALOR]
+        antes = toks[:idx_hifen]
+        
+        # Os 2 últimos números antes do hífen são QTD e VALOR
+        try:
+            valor = br_to_float(antes[-1])
+            qtd = br_to_float(antes[-2])
+        except (IndexError, ValueError):
+            continue
 
         if qtd is None or valor is None:
             continue
 
-        # antes do hífen: COD + NOME + UNIDADE + PREÇO
-        antes = toks[1:idx_hifen]
+        # Remove CODIGO, QTD, VALOR e PREÇO (último número com formato X,XX)
+        nome_tokens = antes[1:-2]  # Remove código e os 2 últimos (qtd, valor)
+        
+        # Remove o preço (último token com formato XX,XX)
+        while nome_tokens and is_num_token(nome_tokens[-1]):
+            nome_tokens.pop()
 
-        # remove o preço (último número antes do hífen)
-        while antes and is_num_token(antes[-1]):
-            antes.pop()
-
-        produto = clean_produto_name(" ".join(antes))
+        produto = clean_produto_name(" ".join(nome_tokens))
         if not produto:
             continue
 
@@ -168,7 +182,7 @@ def parse_perdas_lince(text: str):
             "valor": float(valor)
         })
 
-    # consolidação por produto
+    # Consolidação por produto
     agg = {}
     for it in itens:
         k = it["produto"]
@@ -230,9 +244,12 @@ sug_mes = MESES_PT.get(datetime.today().month, "")
 sug_sem = (datetime.today().day - 1) // 7 + 1
 
 if uploads:
-    base_text = extract_text_with_pypdf(uploads[0])
-    dt_ini, _ = parse_periodo(base_text)
-    sug_mes, sug_sem = sugestao_mes_semana(dt_ini)
+    try:
+        base_text = extract_text_with_pypdf(uploads[0])
+        dt_ini, _ = parse_periodo(base_text)
+        sug_mes, sug_sem = sugestao_mes_semana(dt_ini)
+    except Exception:
+        pass
 
 with col2:
     mes = st.text_input("Mês", value=sug_mes)
@@ -243,12 +260,41 @@ with col3:
 st.markdown("---")
 
 if uploads:
-    all_rows = []
-    for f in uploads:
-        text = extract_text_with_pypdf(f)
-        all_rows.extend(parse_perdas_lince(text))
+    # Validações
+    if not mes.strip():
+        st.error("⚠️ Por favor, preencha o mês!")
+        st.stop()
+    
+    if not semana.strip().isdigit():
+        st.error("⚠️ A semana deve ser um número!")
+        st.stop()
 
-    # consolidação entre PDFs
+    all_rows = []
+    progress = st.progress(0)
+    erros = []
+
+    for i, f in enumerate(uploads):
+        try:
+            text = extract_text_with_pypdf(f)
+            rows = parse_perdas_lince(text)
+            if not rows:
+                erros.append(f"⚠️ Nenhum dado encontrado em: {f.name}")
+            all_rows.extend(rows)
+        except Exception as e:
+            erros.append(f"❌ Erro ao processar {f.name}: {str(e)}")
+        
+        progress.progress((i + 1) / len(uploads))
+
+    # Mostra erros se houver
+    if erros:
+        for erro in erros:
+            st.warning(erro)
+
+    if not all_rows:
+        st.error("❌ Nenhum dado foi extraído dos PDFs. Verifique se são arquivos do Lince (Perdas por Departamento).")
+        st.stop()
+
+    # Consolidação entre PDFs
     agg = {}
     for r in all_rows:
         k = r["produto"]
@@ -259,21 +305,31 @@ if uploads:
 
     final_rows = sorted(agg.values(), key=lambda x: x["valor"], reverse=True)
 
+    st.success(f"✅ {len(final_rows)} produtos processados com sucesso!")
+    
     st.subheader("Prévia dos dados")
     st.dataframe(
         [{
             "Produto": r["produto"],
             "Quantidade": round(r["quantidade"], 3),
-            "Valor": round(r["valor"], 2)
+            "Valor": f"R$ {round(r['valor'], 2):.2f}"
         } for r in final_rows],
         use_container_width=True,
         height=420
     )
 
-    if st.button("Gerar Excel"):
-        excel = build_excel(final_rows, setor, mes.strip(), semana.strip())
-        nome = f"perdas_{setor}_{mes}_sem{semana}.xlsx".replace(" ", "_")
-        st.download_button("⬇️ Baixar Excel", data=excel, file_name=nome)
+    if st.button("📥 Gerar Excel", type="primary"):
+        try:
+            excel = build_excel(final_rows, setor, mes.strip(), semana.strip())
+            nome = f"perdas_{setor}_{mes}_sem{semana}.xlsx".replace(" ", "_")
+            st.download_button(
+                "⬇️ Baixar Excel", 
+                data=excel, 
+                file_name=nome,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        except Exception as e:
+            st.error(f"❌ Erro ao gerar Excel: {str(e)}")
 
 else:
-    st.info("Envie pelo menos um PDF para começar.")
+    st.info("📤 Envie pelo menos um PDF para começar.")
