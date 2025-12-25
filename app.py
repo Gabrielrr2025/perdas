@@ -150,8 +150,222 @@ def parse_perdas_lince(text: str):
             qtd_str = match.group(4)
             valor_str = match.group(5)
             
-            # Limpa o nome (remove unidades duplicadas e espaços extras)
-            nome = re.sub(r'\s+', ' ', nome)
+            # Limpa o nome: remove unidade antes do preço (UN, KG, PCT, etc)
+            nome = re.sub(r'\s+(UN|KG|PCT|G)\s*
+            
+            # Converte quantidade e valor
+            qtd = br_to_float(qtd_str)
+            valor = br_to_float(valor_str)
+            
+            if qtd is not None and valor is not None and qtd > 0 and valor > 0:
+                itens.append({
+                    "codigo": codigo,
+                    "produto": nome,
+                    "quantidade": float(qtd),
+                    "valor": float(valor)
+                })
+    
+    # Consolidação por produto
+    agg = {}
+    for item in itens:
+        chave = item["produto"]
+        if chave not in agg:
+            agg[chave] = {
+                "produto": chave,
+                "quantidade": 0.0,
+                "valor": 0.0
+            }
+        agg[chave]["quantidade"] += item["quantidade"]
+        agg[chave]["valor"] += item["valor"]
+    
+    # Ordena por valor (maior primeiro)
+    resultado = sorted(agg.values(), key=lambda x: x["valor"], reverse=True)
+    
+    return resultado
+
+
+def build_excel(rows, setor, mes, semana):
+    """Gera arquivo Excel com os dados"""
+    output = io.BytesIO()
+    wb = xlsxwriter.Workbook(output, {"in_memory": True})
+    ws = wb.add_worksheet("Dados")
+
+    headers = ["Produto", "Setor", "Mês", "Semana", "Quantidade", "Valor"]
+    header_fmt = wb.add_format({"bold": True, "border": 1, "bg_color": "#D3D3D3"})
+    num3 = wb.add_format({"num_format": "0.000", "border": 1})
+    money = wb.add_format({"num_format": "#,##0.00", "border": 1})
+    text_fmt = wb.add_format({"border": 1})
+    center_fmt = wb.add_format({"border": 1, "align": "center"})
+
+    # Cabeçalhos
+    for c, h in enumerate(headers):
+        ws.write(0, c, h, header_fmt)
+
+    # Dados
+    for i, r in enumerate(rows, start=1):
+        ws.write(i, 0, r["produto"], text_fmt)
+        ws.write(i, 1, setor, text_fmt)
+        ws.write(i, 2, mes, text_fmt)
+        ws.write_number(i, 3, int(semana), center_fmt)
+        ws.write_number(i, 4, round(r["quantidade"], 3), num3)
+        ws.write_number(i, 5, round(r["valor"], 2), money)
+
+    # Largura das colunas
+    ws.set_column(0, 0, 50)  # Produto
+    ws.set_column(1, 1, 20)  # Setor
+    ws.set_column(2, 2, 12)  # Mês
+    ws.set_column(3, 3, 8)   # Semana
+    ws.set_column(4, 4, 12)  # Quantidade
+    ws.set_column(5, 5, 14)  # Valor
+
+    wb.close()
+    output.seek(0)
+    return output.getvalue()
+
+
+# =========================
+# UI
+# =========================
+uploads = st.file_uploader(
+    "Envie 1 ou vários PDFs do Lince (Perdas por Departamento)",
+    type=["pdf"],
+    accept_multiple_files=True
+)
+
+col1, col2, col3 = st.columns(3)
+with col1:
+    setor = st.selectbox("Setor", SETORES_FIXOS)
+
+sug_mes = MESES_PT.get(datetime.today().month, "")
+sug_sem = (datetime.today().day - 1) // 7 + 1
+
+if uploads:
+    try:
+        base_text = extract_text_with_pypdf(uploads[0])
+        dt_ini, _ = parse_periodo(base_text)
+        sug_mes, sug_sem = sugestao_mes_semana(dt_ini)
+    except Exception:
+        pass
+
+with col2:
+    mes = st.text_input("Mês", value=sug_mes)
+
+with col3:
+    semana = st.text_input("Semana", value=str(sug_sem))
+
+st.markdown("---")
+
+if uploads:
+    # Validações
+    if not mes.strip():
+        st.error("⚠️ Por favor, preencha o mês!")
+        st.stop()
+    
+    if not semana.strip().isdigit():
+        st.error("⚠️ A semana deve ser um número!")
+        st.stop()
+
+    all_rows = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    erros = []
+
+    for i, f in enumerate(uploads):
+        status_text.text(f"Processando: {f.name}...")
+        try:
+            text = extract_text_with_pypdf(f)
+            rows = parse_perdas_lince(text)
+            
+            if not rows:
+                erros.append(f"⚠️ Nenhum dado encontrado em: {f.name}")
+            else:
+                all_rows.extend(rows)
+                
+        except Exception as e:
+            erros.append(f"❌ Erro ao processar {f.name}: {str(e)}")
+        
+        progress_bar.progress((i + 1) / len(uploads))
+    
+    status_text.empty()
+    progress_bar.empty()
+
+    # Mostra erros se houver
+    if erros:
+        for erro in erros:
+            st.warning(erro)
+
+    if not all_rows:
+        st.error("❌ Nenhum dado foi extraído dos PDFs. Verifique se são arquivos do Lince (Perdas por Departamento).")
+        st.info("💡 O arquivo deve conter linhas no formato: CODIGO PRODUTO UNIDADE PRECO QUANTIDADE VALOR-")
+        st.stop()
+
+    # Consolidação entre PDFs
+    agg = {}
+    for r in all_rows:
+        k = r["produto"]
+        if k not in agg:
+            agg[k] = {"produto": k, "quantidade": 0.0, "valor": 0.0}
+        agg[k]["quantidade"] += r["quantidade"]
+        agg[k]["valor"] += r["valor"]
+
+    final_rows = sorted(agg.values(), key=lambda x: x["valor"], reverse=True)
+
+    # Calcula totais
+    total_qtd = sum(r["quantidade"] for r in final_rows)
+    total_valor = sum(r["valor"] for r in final_rows)
+
+    st.success(f"✅ {len(final_rows)} produtos processados | Total: R$ {total_valor:,.2f}")
+    
+    st.subheader("Prévia dos dados")
+    st.dataframe(
+        [{
+            "Produto": r["produto"],
+            "Quantidade": f"{r['quantidade']:.3f}",
+            "Valor": f"R$ {r['valor']:.2f}"
+        } for r in final_rows],
+        use_container_width=True,
+        height=420
+    )
+
+    if st.button("📥 Gerar Excel", type="primary", use_container_width=True):
+        try:
+            excel = build_excel(final_rows, setor, mes.strip(), semana.strip())
+            nome = f"perdas_{setor}_{mes}_sem{semana}.xlsx".replace(" ", "_")
+            st.download_button(
+                "⬇️ Baixar Excel", 
+                data=excel, 
+                file_name=nome,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+            st.balloons()
+        except Exception as e:
+            st.error(f"❌ Erro ao gerar Excel: {str(e)}")
+
+else:
+    st.info("📤 Envie pelo menos um PDF para começar.")
+    
+    # Instruções
+    with st.expander("ℹ️ Como usar"):
+        st.markdown("""
+        1. **Faça upload** de um ou mais PDFs do Lince (Perdas por Departamento)
+        2. **Selecione o setor** no dropdown
+        3. **Confira** o mês e semana (preenchidos automaticamente)
+        4. **Visualize** a prévia dos dados
+        5. **Clique em "Gerar Excel"** para baixar o arquivo
+        
+        **Formato esperado do PDF:**
+        ```
+        CODIGO NOME_PRODUTO UNIDADE PRECO QUANTIDADE VALOR-
+        ```
+        
+        **Exemplo:**
+        ```
+        001681 SALG COQUETEL ASSADO KG KG 69,90 7,64 534,18-
+        ```
+        """)
+, '', nome, flags=re.IGNORECASE)
+            nome = re.sub(r'\s+', ' ', nome).strip()
             
             # Converte quantidade e valor
             qtd = br_to_float(qtd_str)
