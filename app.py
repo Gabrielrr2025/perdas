@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+
 import re
 import io
 import pandas as pd
@@ -7,7 +8,7 @@ from datetime import datetime
 from pypdf import PdfReader
 
 # =========================
-# Configuração da página
+# CONFIGURAÇÃO DA PÁGINA
 # =========================
 st.set_page_config(
     page_title="Lince → Excel | Perdas",
@@ -17,92 +18,114 @@ st.set_page_config(
 
 st.title("📄 Lince → Excel (Perdas por Departamento)")
 st.caption(
-    "Envie PDFs do Lince (Padaria, Confeitaria ou Restaurante) "
-    "e gere um Excel padronizado."
+    "Faça upload de PDFs do Lince e gere um Excel padronizado "
+    "com Produto, Setor, Mês, Semana, Quantidade e Valor."
 )
 
 # =========================
-# Funções auxiliares
+# PARÂMETROS MANUAIS
 # =========================
-def extrair_periodo(texto):
-    """
-    Extrai mês e semana a partir do período do PDF
-    Ex: 26/11/2025 a 02/12/2025
-    """
-    m = re.search(r'(\d{2}/\d{2}/\d{4}).+?(\d{2}/\d{2}/\d{4})', texto)
-    if not m:
-        return None, None
+st.subheader("📌 Parâmetros da Planilha")
 
-    data_fim = datetime.strptime(m.group(2), "%d/%m/%Y")
-    mes = data_fim.strftime("%m/%Y")
-    semana = data_fim.isocalendar().week
-    return mes, semana
+col1, col2, col3 = st.columns(3)
 
+with col1:
+    mes_manual = st.text_input(
+        "Mês (MM/AAAA)",
+        placeholder="Ex: 12/2025"
+    )
 
+with col2:
+    semana_manual = st.number_input(
+        "Semana",
+        min_value=1,
+        max_value=53,
+        step=1
+    )
+
+with col3:
+    setor_manual = st.text_input(
+        "Setor",
+        placeholder="Ex: Padaria / Confeitaria / Restaurante"
+    )
+
+st.divider()
+
+# =========================
+# FUNÇÕES AUXILIARES
+# =========================
 def limpar_produto(nome):
-    """
-    Remove códigos e unidades duplicadas
-    """
-    nome = re.sub(r'^\d+\s*-\s*', '', nome)   # remove código
+    nome = re.sub(r'^\d+\s*-\s*', '', nome)
     nome = re.sub(r'\s+(UN|KG|G|PCT)\s*$', '', nome)
     return nome.strip()
 
 
-def parse_pdf(file):
+def parse_pdf(file, mes_manual, semana_manual, setor_manual):
     reader = PdfReader(file)
     registros = []
 
     setor_atual = None
-    mes = None
-    semana = None
+    mes = mes_manual if mes_manual else None
+    semana = semana_manual if semana_manual else None
+    setor_fixo = setor_manual if setor_manual else None
 
     for page in reader.pages:
         texto = page.extract_text()
         if not texto:
             continue
 
-        if mes is None:
-            mes, semana = extrair_periodo(texto)
-
         linhas = texto.splitlines()
 
         for linha in linhas:
             linha = linha.strip()
 
-            # Setor
-            if linha.startswith("000") and "-" in linha and " - " in linha:
-                setor_atual = linha.split(" - ", 1)[1].strip()
+            # Captura automática do setor (caso não seja manual)
+            if re.match(r'\d{4}\s+.+\s-\s*$', linha):
+                if not setor_fixo:
+                    setor_atual = linha.split(" ", 1)[1].replace("-", "").strip()
                 continue
 
             # Ignorar totais
             if linha.startswith("Total"):
                 continue
 
-            # Linhas de produto
-            m = re.match(
-                r'(\d+)\s+(.+?)\s+(UN|KG)\s+([\d,]+)\s+([\d,]+)',
-                linha
-            )
+            # Linha de produto começa com código
+            if not re.match(r'\d{5}', linha):
+                continue
 
-            if m:
-                produto = limpar_produto(m.group(2))
-                quantidade = float(m.group(4).replace(",", "."))
-                valor = float(m.group(5).replace(",", "."))
+            # Extrair nome do produto
+            nome_match = re.match(r'\d{5}\s+(.+?)\s+(UN|KG)', linha)
+            if not nome_match:
+                continue
 
-                registros.append({
-                    "Produto": produto,
-                    "Setor": setor_atual,
-                    "Mês": mes,
-                    "Semana": semana,
-                    "Quantidade": quantidade,
-                    "Valor": valor
-                })
+            produto = limpar_produto(nome_match.group(1))
+
+            # Extrair todos os números da linha
+            numeros = re.findall(r'\d+,\d+|\d+', linha)
+
+            if len(numeros) < 2:
+                continue
+
+            try:
+                quantidade = float(numeros[-2].replace(",", "."))
+                valor = float(numeros[-1].replace(",", "."))
+            except ValueError:
+                continue
+
+            registros.append({
+                "Produto": produto,
+                "Setor": setor_fixo if setor_fixo else setor_atual,
+                "Mês": mes,
+                "Semana": semana,
+                "Quantidade": quantidade,
+                "Valor": valor
+            })
 
     return registros
 
 
 # =========================
-# Upload de arquivos
+# UPLOAD DOS PDFS
 # =========================
 files = st.file_uploader(
     "📤 Envie os PDFs do Lince",
@@ -111,30 +134,39 @@ files = st.file_uploader(
 )
 
 if files:
-    dados = []
-
-    for f in files:
-        dados.extend(parse_pdf(f))
-
-    if not dados:
-        st.warning("Nenhum dado válido encontrado nos PDFs.")
+    if not mes_manual or not semana_manual or not setor_manual:
+        st.error("⚠️ Preencha Mês, Semana e Setor antes de processar os PDFs.")
     else:
-        df = pd.DataFrame(dados)
+        dados = []
 
-        st.success(f"✅ {len(df)} registros extraídos com sucesso")
+        for f in files:
+            dados.extend(
+                parse_pdf(
+                    f,
+                    mes_manual,
+                    semana_manual,
+                    setor_manual
+                )
+            )
 
-        st.dataframe(df, use_container_width=True)
+        if not dados:
+            st.warning("Nenhum dado válido foi encontrado nos PDFs.")
+        else:
+            df = pd.DataFrame(dados)
 
-        # Exportar Excel
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-            df.to_excel(writer, index=False, sheet_name="Perdas")
+            st.success(f"✅ {len(df)} registros extraídos com sucesso")
+            st.dataframe(df, use_container_width=True)
 
-        st.download_button(
-            "⬇️ Baixar Excel",
-            data=buffer.getvalue(),
-            file_name="perdas_lince.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+            # =========================
+            # EXPORTAR EXCEL
+            # =========================
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+                df.to_excel(writer, index=False, sheet_name="Perdas")
 
-
+            st.download_button(
+                "⬇️ Baixar Excel",
+                data=buffer.getvalue(),
+                file_name="perdas_lince.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
