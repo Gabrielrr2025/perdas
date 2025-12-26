@@ -45,7 +45,6 @@ MESES_PT = {
 # Utilitários
 # =========================
 def br_to_float(txt: str):
-    """Converte string BR (1.234,56) para float"""
     if txt is None:
         return None
     t = str(txt).strip()
@@ -58,19 +57,17 @@ def br_to_float(txt: str):
 
 
 def extract_text_with_pypdf(file) -> str:
-    """Extrai texto de todas as páginas do PDF"""
     reader = PdfReader(file)
-    parts = []
+    texts = []
     for page in reader.pages:
         try:
-            parts.append(page.extract_text() or "")
+            texts.append(page.extract_text() or "")
         except Exception:
-            parts.append("")
-    return "\n".join(parts)
+            texts.append("")
+    return "\n".join(texts)
 
 
 def parse_periodo(text: str):
-    """Extrai período do relatório (Período: dd/mm/yyyy a dd/mm/yyyy)"""
     t = " ".join((text or "").split())
     m = re.search(
         r"Per[ií]odo:\s*(\d{2}/\d{2}/\d{4}).*?(\d{2}/\d{2}/\d{4})",
@@ -88,7 +85,6 @@ def parse_periodo(text: str):
 
 
 def sugestao_mes_semana(dt_ini):
-    """Sugere mês (nome PT) e semana (1–5)"""
     if not dt_ini:
         hoje = datetime.today().date()
         return MESES_PT.get(hoje.month, ""), (hoje.day - 1) // 7 + 1
@@ -96,26 +92,20 @@ def sugestao_mes_semana(dt_ini):
 
 
 def clean_produto_name(nome: str) -> str:
-    """Normalização leve (mantém texto do PDF)"""
+    """
+    - Remove UN somente se estiver no final
+    - Mantém KG e gramaturas (80G, 120G etc.)
+    """
     nome = (nome or "").strip()
     nome = re.sub(r"\s{2,}", " ", nome)
-    nome = re.sub(r"^\-\s*", "", nome)
+    nome = re.sub(r"\s+UN$", "", nome, flags=re.IGNORECASE)
     return nome
 
 
 # =========================
-# PARSER DEFINITIVO (ROBUSTO)
+# PARSER DEFINITIVO (Lince)
 # =========================
 def parse_perdas_lince(text: str):
-    """
-    Parser para 'Perdas por Departamento' (Lince)
-
-    Regras:
-    - Quantidade = número logo após o '-'
-    - Valor = último número da linha
-    - Nome = tudo entre o código e o preço
-    - Mantém 'KG/UN/etc' quando fizer parte do nome
-    """
     lines = [
         re.sub(r"\s{2,}", " ", (ln or "")).strip()
         for ln in (text or "").splitlines()
@@ -129,17 +119,19 @@ def parse_perdas_lince(text: str):
         "www.grupotecnoweb.com.br", "Lince", "MATRIZ"
     )
 
-    items = []
+    itens = []
 
     for ln in lines:
         if not ln or any(k in ln for k in lixo):
             continue
 
         toks = ln.split()
-        # código do produto (flexível)
-        if not toks or not re.fullmatch(r"\d{3,10}", toks[0]):
+
+        # Código do produto
+        if not toks or not re.fullmatch(r"\d{4,6}", toks[0]):
             continue
 
+        # O hífen é o divisor confiável
         if "-" not in toks:
             continue
 
@@ -149,28 +141,30 @@ def parse_perdas_lince(text: str):
 
         qtd = br_to_float(toks[idx + 1])
         valor = br_to_float(toks[idx + 2])
-        if qtd is None or valor is None or qtd < 0 or valor < 0:
+
+        if qtd is None or valor is None:
             continue
 
-        # antes do hífen: COD + NOME + UNIDADE + PREÇO
+        # Nome = tudo entre código e preço
         antes = toks[1:idx]
-        # remove o preço (último número antes do hífen)
+
+        # Remove o preço do final do nome
         while antes and re.fullmatch(r"[0-9][0-9\.\,]*", antes[-1]):
             antes.pop()
 
-        produto = clean_produto_name(" ".join(antes))
-        if not produto:
+        nome = clean_produto_name(" ".join(antes))
+        if not nome:
             continue
 
-        items.append({
-            "produto": produto,
+        itens.append({
+            "produto": nome,
             "quantidade": float(qtd),
             "valor": float(valor)
         })
 
-    # consolidação por produto
+    # Consolidação por produto
     agg = {}
-    for it in items:
+    for it in itens:
         k = it["produto"]
         if k not in agg:
             agg[k] = {"produto": k, "quantidade": 0.0, "valor": 0.0}
@@ -270,10 +264,10 @@ if uploads:
     progress.empty()
 
     if not all_rows:
-        st.error("❌ Nenhum dado extraído. Verifique se os PDFs são do Lince (Perdas).")
+        st.error("❌ Nenhum dado extraído. Verifique se o PDF é do Lince (Perdas).")
         st.stop()
 
-    # consolidação entre PDFs
+    # Consolidação entre PDFs
     agg = {}
     for r in all_rows:
         k = r["produto"]
@@ -311,3 +305,4 @@ if uploads:
 
 else:
     st.info("📤 Envie pelo menos um PDF para começar.")
+
